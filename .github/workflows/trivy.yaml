@@ -1,0 +1,66 @@
+name: ECR Image Scan and Send to Datadog
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  trivy-scan:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
+
+    # Configure AWS Credentials
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+
+    # Login to Amazon ECR
+    - name: Login to Amazon ECR
+      uses: aws-actions/amazon-ecr-login@v2
+
+    # Pull image from ECR
+    - name: Pull Docker Image from ECR
+      run: |
+        ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+        IMAGE_URI=$ACCOUNT_ID.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_REPOSITORY }}:${{ secrets.IMAGE_TAG }}
+        docker pull $IMAGE_URI
+        echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_ENV
+
+    # Install Trivy
+    - name: Install Trivy
+      run: |
+        sudo apt-get update
+        sudo apt-get install wget jq -y
+        wget https://github.com/aquasecurity/trivy/releases/latest/download/trivy_0.50.0_Linux-64bit.deb
+        sudo dpkg -i trivy_0.50.0_Linux-64bit.deb
+
+    # Scan Image with Trivy
+    - name: Scan Docker Image
+      run: |
+        trivy image --format json -o trivy-report.json $IMAGE_URI
+
+    # Fail if CRITICAL vulnerabilities found
+    - name: Check for Critical Vulnerabilities
+      run: |
+        CRITICAL=$(jq '[.Results[].Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-report.json)
+        echo "Critical vulnerabilities: $CRITICAL"
+        if [ "$CRITICAL" -gt 0 ]; then
+          echo "CRITICAL vulnerabilities found! Failing pipeline."
+          exit 1
+        fi
+
+    # Send Report to Datadog Logs API
+    - name: Send Report to Datadog
+      run: |
+        curl -X POST "https://http-intake.logs.datadoghq.com/v1/input/${{ secrets.DD_API_KEY }}" \
+        -H "Content-Type: application/json" \
+        -d @trivy-report.json
+      
